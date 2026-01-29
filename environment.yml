@@ -1,4 +1,4 @@
-name: cad-token-3d
+name: cad-3d-token
 channels:
   - defaults
 dependencies:
