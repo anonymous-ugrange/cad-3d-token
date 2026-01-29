@@ -1,0 +1,36 @@
+draw2cad:
+  d_model: 256
+  n_heads: 8
+  n_layers: 4
+  dim_feedforward: 512
+  dropout: 0.1
+  input_option: "4x"
+
+test:
+  # Batch size for training
+  batch_size: 256
+  # Number of workers for the DataLoader during training
+  num_workers: 1
+  # Prefetch factor for the DataLoader during training
+  prefetch_factor: 1
+  # Directory for logging training information
+  log_dir: 
+  # Path to saved model checkpoint (optional)
+  checkpoint_path: [
+
+  ]
+  nucleus_prob: 0
+  sampling_type: "max"
+  clouds: False
+
+# --------------- Configuration related to training dataloader --------------- #
+test_data:
+  cad_seq_dir: 
+  svg_dir: 
+  split_filepath: 
+
+# ----------------------------- Debug mode flag ----------------------------- #
+debug: False
+
+# --------------- Additional information (leave empty for now) --------------- #
+info: "Inference"

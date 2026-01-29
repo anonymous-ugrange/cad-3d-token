@@ -1,0 +1,51 @@
+# --------------- SIGNet ----------------------
+draw2cad:
+  d_model: 256
+  n_heads: 8
+  n_layers: 4
+  dim_feedforward: 512
+  dropout: 0.1
+  input_option: "4x"
+  
+# --------------- Configuration related to training dataloader --------------- #
+train_data:
+  cad_seq_dir:
+  svg_dir:
+  split_filepath:
+
+# --------------------- Configuration related to training -------------------- #
+train:
+  # Learning rate for training
+  lr: 0.001
+  # Batch size for training
+  batch_size: 128
+  # Number of epochs for training
+  num_epochs: 200
+  #Number of iterations for warm up
+  warm_up: 2000
+  # Number of workers for the DataLoader during training
+  num_workers: 1
+  # Prefetch factor for the DataLoader during training
+  prefetch_factor: 1
+  # Directory for logging training information
+  log_dir: 
+  # Path to saved model checkpoint for Resuming Training (optional)
+  checkpoint_path: 
+  # Checkpoint interval
+  checkpoint_interval: 5
+  # Curriculum learning epoch (set to 0 for no curriculum learning)
+  curriculum_learning_epoch: 0
+  
+# ------------------------- Validation configuration ------------------------- #
+val:
+  # Nucleus sampling probability for validation (set to 0 for greedy decoding)
+  frequency: 5
+  nucleus_prob: 0
+  val_batch: 5
+
+# ------------------------------ Debug mode flag ----------------------------- #
+# In debug mode, the model weights are not saved
+debug: False
+
+# --------------- Additional information (leave empty for now) --------------- #
+info: "Experiment 1: Base Model Training"

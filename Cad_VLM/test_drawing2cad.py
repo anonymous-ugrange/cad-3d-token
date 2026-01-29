@@ -1,0 +1,344 @@
+import os
+import sys
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+sys.path.append("..")
+sys.path.append("/".join(os.path.abspath(__file__).split("/")[:-2]))
+
+from CadSeqProc.cad_sequence import CADSequence
+from CadSeqProc.utility.macro import *
+from Cad_VLM.config.macro import ORIGINAL
+from CadSeqProc.utility.utils import chamfer_dist, normalize_pc
+from CadSeqProc.utility.logger import CLGLogger
+from Cad_VLM.models.draw2cad import SVG2CADTransformer
+from Cad_VLM.models.utils import print_with_separator
+from Cad_VLM.dataprep.t2c_dataset_new import get_draw2cad_dataloaders, StartEnd
+from loguru import logger
+from rich import print
+import torch
+import argparse
+from tqdm import tqdm
+import os
+import datetime
+import argparse
+import yaml
+import warnings
+import logging.config
+import pickle
+
+import trimesh
+import json
+
+warnings.filterwarnings("ignore")
+logging.config.dictConfig(
+    {
+        "version": 1,
+        "disable_existing_loggers": True,
+    }
+)
+
+t2clogger = CLGLogger().configure_logger(verbose=True).logger
+
+
+def parse_config_file(config_file):
+    with open(config_file, "r") as file:
+        yaml_data = yaml.safe_load(file)
+    return yaml_data
+
+
+def save_yaml_file(yaml_data, filename, output_dir):
+    with open(os.path.join(output_dir, filename), "w+") as f:
+        yaml.dump(yaml_data, f, default_flow_style=False)
+
+
+def check_file_with_sleep(file_path, sleep_interval):
+    import time
+
+    waited = 0
+    while not os.path.exists(file_path):
+        print(
+            f"File:{file_path} not exist," 
+            f"sleep {sleep_interval}s, waited {waited}s"
+        )
+        time.sleep(sleep_interval)
+        waited += sleep_interval
+    
+    print(f"File exist, waited {waited}s")
+
+
+@logger.catch()
+def main():
+    print_with_separator("😊 Draw2CAD Inference 😊")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--config_path",
+        type=str,
+        default="config/inference.yaml",
+    )
+    args = parser.parse_args()
+    config = parse_config_file(args.config_path)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    t2clogger.info(
+        "Current Device {}",
+        torch.cuda.get_device_properties(device),
+    )
+
+    # -------------------------------- Load Model -------------------------------- #
+    cad_config = config["draw2cad"]
+    cad_config["device"] = device
+    model = SVG2CADTransformer.from_config(cad_config).to(device)
+
+    log_dir = os.path.join(
+        config["test"]["log_dir"]
+    )
+
+    # Create the log dir if it doesn't exist
+    if not config["debug"]:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        save_yaml_file(
+            config, filename=args.config_path.split("/")[-1], output_dir=log_dir
+        )
+
+    # -------------------------------- Train Model ------------------------------- #
+    if config["test"]["checkpoint_path"] is not None:
+        checkpoint_files = config["test"]["checkpoint_path"]
+        if not isinstance(checkpoint_files, list):
+            checkpoint_files = [checkpoint_files]
+    
+    for checkpoint_file in checkpoint_files:
+        check_file_with_sleep(checkpoint_file, sleep_interval=1000)
+
+        filename = os.path.basename(checkpoint_file)
+        filename = os.path.splitext(filename)[0]
+        sub_dir = os.path.join(log_dir, filename)
+
+        test_model(
+            model=model,
+            checkpoint_file=checkpoint_file,
+            device=device,
+            log_dir=sub_dir,
+            config=config,
+            logger=t2clogger,
+        )
+
+
+def test_model(
+    model,
+    checkpoint_file,
+    device,
+    log_dir,
+    config,
+    logger,
+):
+    """
+    Trains a deep learning model.
+
+    Parameters:
+        model (torch.nn.Module): The neural network model.
+        device (str): Device to train on ('cuda' for GPU, 'cpu' for CPU).
+        log_dir (str): Directory to save logs and checkpoints.
+        config (dict): Additional configuration parameters.
+
+    Returns:
+        None
+    """
+
+    # Create the dataloader for train
+    test_loader = get_draw2cad_dataloaders(
+        cad_seq_dir=config["test_data"]["cad_seq_dir"],
+        svg_dir=config["test_data"]["svg_dir"],
+        split_filepath=config["test_data"]["split_filepath"],
+        subsets=["test"],
+        input_option=config["draw2cad"]["input_option"],
+        batch_size=config["test"]["batch_size"],
+        pin_memory=True,
+        num_workers=config["test"]["num_workers"],
+        prefetch_factor=config["test"]["prefetch_factor"],
+    )[0]
+
+    if not config["debug"]:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+    logger.info(f"Saving results in {log_dir}.")
+    if checkpoint_file is not None:
+        print(f"Using saved checkpoint at {checkpoint_file}.")
+        checkpoint_file_name = checkpoint_file.split("/")[-1]
+        checkpoint = torch.load(checkpoint_file, map_location=device)
+
+        if "epoch" in checkpoint:
+            print(f"Model was trained for epoch {checkpoint['epoch']}.")
+
+        pretrained_dict = {}
+        for key, value in checkpoint["model_state_dict"].items():
+            if key.split(".")[0] == "module":
+                pretrained_dict[".".join(key.split(".")[1:])] = value
+            else:
+                pretrained_dict[key] = value
+
+        model.load_state_dict(pretrained_dict, strict=False)
+        if not config["debug"]:
+            save_yaml_file(
+                config,
+                filename=f"config_{checkpoint_file_name.split('.')[0]}.yaml",
+                output_dir=log_dir,
+            )
+
+    # ---------------------------------- Inference ---------------------------------- #
+    test_acc_uid = {}
+    invalid_dict = {}
+    sample_i, level = 0, "expert"
+    model.eval()
+    if config["test"]["sampling_type"] == "max":
+        TOPK = 1
+    else:
+        TOPK = 5
+
+    with torch.no_grad():
+        with tqdm(test_loader, ascii=True, desc=f"Inference✨") as pbar:
+            for uids, vec_dict, mask_cad_dict, svg_dict in pbar:
+                for key, value in vec_dict.items():
+                    vec_dict[key] = value.to(device)
+
+                for key, value in svg_dict.items():
+                    svg_dict[key] = value.to(device)
+
+                for topk_index in range(1, TOPK + 1):
+                    # Autoregressive Prediction (5 outputs per sample)
+                    pred_cad_seq_dict = model.test_decode(
+                        svg_dict=svg_dict,
+                        maxlen=MAX_CAD_SEQUENCE_LENGTH,
+                        nucleus_prob=0,
+                        topk_index=topk_index,
+                        device=device,
+                    )
+
+                    # Save the results batchwise
+                    for i in range(vec_dict["cad_vec"].shape[0]):
+                        uid = uids[i]
+
+                        if not ORIGINAL:
+                            pred_cad_vec = StartEnd.restore_vec(
+                                pred_cad_seq_dict["cad_vec"][i]
+                            )
+                            gt_cad_vec = StartEnd.restore_vec(
+                                vec_dict["cad_vec"][i]
+                            )
+                        else:
+                            pred_cad_vec = pred_cad_seq_dict["cad_vec"][i]
+                            gt_cad_vec = vec_dict["cad_vec"][i]
+
+                        # if topk_index == 1:
+                        if uid not in test_acc_uid:
+                            test_acc_uid[uid] = {}
+
+                        if level not in test_acc_uid[uid]:
+                            test_acc_uid[uid][level] = {}
+
+                        is_invalid = 0
+                        try:
+                            gt_cad = (
+                                CADSequence.from_vec(
+                                    gt_cad_vec.cpu().numpy(),
+                                    bit=N_BIT,
+                                    post_processing=True,
+                                )
+                                .create_cad_model()
+                                .sample_points(n_points=8192)
+                            )
+                        except:
+                            continue
+
+                        try:
+                            pred_cad = (
+                                CADSequence.from_vec(
+                                    pred_cad_vec.cpu().numpy(),
+                                    bit=N_BIT,
+                                    post_processing=True,
+                                )
+                                .create_cad_model()
+                                .sample_points(n_points=8192)
+                            )
+                        except Exception as e:
+                            is_invalid = 1
+                            pred_cad = None
+                            
+                        # Save the model prediction output
+                        try:
+                            test_acc_uid[uid][level]["pred_cad_vec"].append(
+                                pred_cad_vec.cpu().numpy()
+                            )
+                        except:
+                            test_acc_uid[uid][level]["pred_cad_vec"] = [
+                                pred_cad_vec.cpu().numpy()
+                            ]
+                            # Adding Ground Truth Label
+                            test_acc_uid[uid][level]["gt_cad_vec"] = (
+                                gt_cad_vec.cpu().numpy()
+                            )
+                            test_acc_uid[uid][level]["cd"] = []
+
+                        # If the model is valid, add the chamfer distance (Multiplied by 1000)
+                        if is_invalid == 0:
+                            cd = (
+                                chamfer_dist(
+                                    normalize_pc(gt_cad.points),
+                                    normalize_pc(pred_cad.points),
+                                )
+                                * 1000
+                            )
+
+                            if config["test"]["clouds"] and cd > 50:
+                                save_dir = os.path.join(log_dir, "clouds", 
+                                                        f"{uid}_cd{cd}")
+                                if not os.path.exists(save_dir):
+                                    os.makedirs(save_dir)
+                                pred_cloud = trimesh.points.PointCloud(pred_cad.points)
+                                gt_cloud = trimesh.points.PointCloud(gt_cad.points)
+                                pred_cloud.export(os.path.join(save_dir, "pred.ply"))
+                                gt_cloud.export(os.path.join(save_dir, "gt.ply"))
+
+                                cad_dict = {
+                                    "gt": test_acc_uid[uid][level]["gt_cad_vec"].tolist(),
+                                    "pred": test_acc_uid[uid][level]["pred_cad_vec"][-1].tolist(),
+                                }
+                                with open(os.path.join(save_dir, "cad.json"), "a") as f:
+                                    json.dump(cad_dict, f)
+                                
+                        else:  # If the model is invalid, -1 chamfer distance (will be filtered in the evaluation stage)
+                            cd = -1
+                            
+                            if uid not in invalid_dict:
+                                invalid_dict[uid] = {}
+                            invalid_dict[uid][level] = \
+                                test_acc_uid[uid][level]["pred_cad_vec"][-1].tolist()
+
+                        test_acc_uid[uid][level]["cd"].append(cd)
+
+                        pbar.set_postfix({"uid": uid, "cd": cd})
+
+                        test_acc_uid[uid][level]["is_invalid"] = is_invalid
+
+                # if not config['debug']:
+                #     # Save the pkl files
+                #     with open(log_dir+"/output.pkl", "wb") as f:
+                #         pickle.dump(test_acc_uid, f,
+                #                     protocol=pickle.HIGHEST_PROTOCOL)
+
+    if not config["debug"]:
+        # Save the pkl files (overwrites the previous file)
+        with open(log_dir + "/output.pkl", "wb") as f:
+            pickle.dump(test_acc_uid, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        with open(os.path.join(log_dir, "invalid.json"), "a") as f:
+            json.dump(invalid_dict, f)
+
+    logger.success(f"Inference Complete")
+
+
+if __name__ == "__main__":
+    main()
